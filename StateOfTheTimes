@@ -1,0 +1,201 @@
+State of Project - Backend and Modular Quickbooks Handler
+
+**Backend (WMX) — brief**
+
+Stack: Node 20 + Express (TypeScript), Postgres 16, Docker Compose v2, Nginx TLS (Let’s Encrypt).
+
+Structure:
+
+apps/server: API (Express routes, health, QBO routes, webhook, small test endpoints).
+
+packages/qbo-token-manager: self-contained QuickBooks auth/token logic.
+
+infra/docker: Dockerfile, docker-compose, .env (runtime), Nginx vhost.
+
+Runtime: API listens on :3000 (bound to 0.0.0.0), Nginx proxies wemakemarin.com → API.
+
+DB: two tables — integrations (anchor row per tenant/provider) and qbo_tokens (access/refresh tokens, expires_at), keyed by (integration_id, realm_id).
+
+Background worker: apps/server/src/jobs/refresher.ts runs every 10 min; refreshes tokens expiring within 5 min; rotates and persists new refresh tokens.
+
+**QuickBooks token handler — brief**
+
+Module: @qbo/token-manager (in packages/qbo-token-manager) — framework-agnostic, reusable.
+
+Exports:
+
+buildAuthorizeUrl(state): constructs Intuit OAuth URL from env (QBO_CLIENT_ID, QBO_REDIRECT_URI, QBO_ENV).
+
+handleCallback(db, code, realmId, integrationId): exchanges the auth code for access_token/refresh_token, computes expires_at, upserts into qbo_tokens.
+
+makeQboWebhookHandler(onEvents): Express handler that verifies Intuit webhook signatures (uses QBO_WEBHOOK_VERIFIER_TOKEN) and hands payloads to your callback.
+
+**Routes (server):**
+
+GET /quickbooks/launch → 302 to Intuit consent (uses buildAuthorizeUrl).
+
+GET /quickbooks/callback → calls handleCallback; on success stores tokens for (integration_id, realm_id).
+
+POST /api/webhooks/quickbooks → signature-verified event intake.
+
+Auto-refresh: background job selects rows with expires_at near/under threshold and POSTs to Intuit token endpoint using current refresh_token; updates access_token, rotates and saves new refresh_token, and pushes expires_at forward.
+
+Key env vars: QBO_CLIENT_ID, QBO_CLIENT_SECRET, QBO_REDIRECT_URI (must match Intuit exactly), QBO_ENV (sandbox/production), QBO_WEBHOOK_VERIFIER_TOKEN, QBO_INTEGRATION_ID.
+
+Safety/ops: secrets live only in .env; FK requires seeding integrations(id = QBO_INTEGRATION_ID); callback wrapped in try/catch to avoid 502s; Nginx handles TLS + redirects.
+
+That’s the essence: a small, modular QBO auth core with clean Express glue, durable storage in Postgres, and an autonomous refresh loop to keep tokens valid.
+
+
+**WMX Backend — Technical Overview**
+Runtime & Services
+Language/Runtime: Node.js 20 (TypeScript → CommonJS build).
+Framework: Express.
+DB: PostgreSQL 16.
+Reverse proxy/TLS: Nginx + Let’s Encrypt.
+Containerization: Docker Compose v2.
+
+Processes:
+api — HTTP API (OAuth launch/callback, webhook, health, test endpoints).
+refresher — background worker that renews QBO access/refresh tokens.
+db — Postgres (internal network only).
+
+Codebase Layout (monorepo)
+wmx/
+  apps/
+    server/
+      src/
+        index.ts             # Express bootstrap (binds 0.0.0.0:3000)
+        env.ts               # zod-validated config/env
+        db.ts                # pg Pool (and/or drizzle binding)
+        middlewares/rawBody.ts  # preserves raw body for webhook HMAC verify
+        routes/
+          health.ts          # GET /health → { ok: true }
+          qbo.ts             # Launch, Callback, Webhook, CompanyInfo test
+        jobs/
+          refresher.ts       # token refresh loop (10m cadence)
+  packages/
+    qbo-token-manager/
+      src/
+        index.ts             # public API: buildAuthorizeUrl, handleCallback, webhook handler factory
+        auth.ts              # code/refresh exchange + persistence
+        client.ts            # helpers
+        models.ts            # schema/types
+        webhooks.ts          # signature verification
+      migrations/2025-09-17_qbo_init.sql  # schema bootstrap
+  infra/
+    docker/
+      Dockerfile             # workspace build + healthcheck
+      docker-compose.yml     # services: db, api, refresher
+      .env                   # runtime config (not committed)
+    nginx/
+      wemakemarin.conf       # vhost (80→443, proxy to :3000)
+
+Data Model
+integrations
+id uuid PK (this equals QBO_INTEGRATION_ID)
+provider text (e.g., quickbooks)
+org_id uuid
+is_active boolean
+timestamps
+qbo_tokens
+integration_id uuid FK → integrations(id)
+realm_id text (QBO company id)
+access_token text
+refresh_token text
+expires_at timestamptz
+version int default 0, timestamps
+
+Recommended constraints/indexes:
+UNIQUE (integration_id, realm_id)
+INDEX (expires_at)
+
+Configuration (env) - Required at runtime (via infra/docker/.env):
+PORT (e.g., 3000)
+DATABASE_URL (e.g., postgres://postgres:postgres@db:5432/app)
+QBO_CLIENT_ID, QBO_CLIENT_SECRET
+QBO_REDIRECT_URI (exact match with Intuit app, e.g. https://www.wemakemarin.com/quickbooks/callback)
+QBO_ENV (sandbox | production)
+QBO_WEBHOOK_VERIFIER_TOKEN
+QBO_INTEGRATION_ID (UUID; must exist in integrations)
+
+HTTP Surfaces (current)
+GET /health — liveness probe.
+GET /quickbooks/launch — redirects to Intuit OAuth consent.
+GET /quickbooks/callback — handles code + realmId → persists tokens; user-friendly success/failure.
+POST /api/webhooks/quickbooks — verifies Intuit webhook signature, forwards payload.
+GET /quickbooks/company — sample Accounting API call using the stored bearer.
+*Frontend can also hit GET /api/integrations/quickbooks/connect to receive a JSON { url } for popup auth.*
+
+**OAuth & Token Flow**
+1) Authorization Code
+Client → GET /quickbooks/launch
+  ↳ buildAuthorizeUrl(state) → 302 to Intuit consent
+
+Intuit → GET /quickbooks/callback?code=...&realmId=...
+api:
+  handleCallback(db, code, realmId, integrationId):
+    - POST /oauth2/v1/tokens/bearer (Basic client_id:client_secret, grant_type=authorization_code)
+    - Persist { access_token, refresh_token, expires_at } to qbo_tokens
+
+2) Background Refresh
+refresher (every 10 minutes):
+  SELECT rows WHERE expires_at IS NULL OR <= NOW()+5m LIMIT 50
+  For each:
+    POST /oauth2/v1/tokens/bearer (grant_type=refresh_token)
+    - Update access_token
+    - Rotate & persist refresh_token (if returned)
+    - Push expires_at forward (now + expires_in)
+
+
+Key detail: updates rows by (integration_id, realm_id) (no id column required).
+
+Rotation: always store the newest refresh_token from Intuit’s response.
+
+3) Webhooks
+Express route uses rawBody middleware so the exact payload bytes can be HMAC-verified against QBO_WEBHOOK_VERIFIER_TOKEN.
+After verification, your callback receives the parsed JSON for downstream processing (e.g., queue a CDC fetch).
+Using the Tokens (Accounting API)
+Base URL:
+https://quickbooks.api.intuit.com (production)
+https://sandbox-quickbooks.api.intuit.com (sandbox)
+
+Typical queries (SQL-like via query param):
+Customers: GET /v3/company/{realmId}/query?query=select%20*%20from%20Customer&minorversion=76
+Items (products): GET /v3/company/{realmId}/query?query=select%20*%20from%20Item&minorversion=76
+Invoices: GET /v3/company/{realmId}/query?query=select%20*%20from%20Invoice&minorversion=76
+Auth header: Authorization: Bearer <access_token>
+
+Error Handling & Hardening
+Callback route wrapped in try/catch; responds 4xx/5xx instead of crashing (prevents 502s).
+
+Common pitfalls:
+invalid_request / invalid_grant → redirect URI mismatch or reusing a consumed code.
+FK violation on qbo_tokens.integration_id → seed integrations row matching QBO_INTEGRATION_ID.
+Port 3000 busy → free port or adjust Nginx/compose mapping.
+Retries/Backoff: add exponential backoff for token refresh if you hit transient 5xx from Intuit.
+Rate limits: respect Accounting API rate limits; consider queueing/pacing bulk pulls.
+Secrets: keep all secrets in .env; rotate client secret & re-connect to mint a new refresh token as needed.
+
+Observability
+Health: GET /health (Nginx proxies / to /health in prod).
+Logs: docker compose -p wmx logs --tail=200 api / refresher.
+DB inspection: \dt, \d+ qbo_tokens, select latest updated_at to confirm refresh job.
+
+Deployment & Ops (high level)
+Build/run: docker compose -p wmx up -d --build (services: db, api, refresher).
+Restart one service: docker compose -p wmx up -d --build api.
+TLS: Certbot nginx plugin; Nginx vhost proxies to 127.0.0.1:3000, HTTP→HTTPS redirect.
+Zero-downtime: Docker rebuilds are quick; consider a blue/green or versioned tag if you add more services.
+
+Extensibility (multi-integration)
+Reuse integrations(id) as the anchor across providers.
+
+For each new provider:
+Add a *-token-manager package (auth/refresh/webhook wrapper).
+Add a *-tokens table (integration_id FK + provider-specific keys).
+Add routes and (optional) a worker loop like the QBO refresher.
+Keep handlers small and modular; publish internal packages if you’ll reuse them.
+
+
+Bottom line: The system isolates OAuth/token mechanics inside a reusable package (@qbo/token-manager), persists durable credentials in Postgres via a simple schema, and continuously keeps credentials fresh via a background worker—freeing the API routes to focus on business fetches (Customers/Items/Invoices) and webhook-driven sync.
