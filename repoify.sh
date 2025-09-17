@@ -2,7 +2,7 @@
 set -euo pipefail
 
 GH_USER="Sonni4154"
-REPO_NAME="wmx"
+REPO_NAME="Ultimate"
 REPO_DESC="WMX backend + modular QBO token manager (Node/TypeScript, Postgres, Docker, Nginx)"
 WORKDIR="/opt/wmx"
 
