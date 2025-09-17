@@ -1,0 +1,11 @@
+{
+  "name": "wmx",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "build": "pnpm -r build",
+    "dev": "pnpm --filter server dev",
+    "lint": "echo \"(no lint configured)\""
+  }
+}

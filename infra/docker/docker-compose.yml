@@ -1,0 +1,40 @@
+version: "3.9"
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: app
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    # no host port mapping; API uses the compose network
+  refresher:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile
+    env_file: [".env"]
+    # This runs a tiny worker that periodically refreshes QBO tokens
+    command: ["node","apps/server/dist/jobs/refresher.js"]
+    depends_on: [db]
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile
+    env_file: [".env"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      PORT: 3000
+      QBO_CLIENT_ID: ${QBO_CLIENT_ID}
+      QBO_CLIENT_SECRET: ${QBO_CLIENT_SECRET}
+      QBO_REDIRECT_URI: ${QBO_REDIRECT_URI}
+      QBO_ENV: ${QBO_ENV}
+      QBO_WEBHOOK_VERIFIER_TOKEN: ${QBO_WEBHOOK_VERIFIER_TOKEN}
+      QBO_INTEGRATION_ID: ${QBO_INTEGRATION_ID}
+    ports: ["3000:3000"]
+    depends_on: [db]
+    restart: unless-stopped
+volumes:
+  pgdata: {}
